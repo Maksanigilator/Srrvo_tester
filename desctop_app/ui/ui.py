@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QTimer
 
 from ..protocol.client import Client
+from ..protocol.emulator import DEMO_PORT, DemoTransport
 from ..protocol.message import CMD_PING
 from ..protocol.transport import MySerialTransport, get_ports
 
@@ -121,6 +122,7 @@ class MainWindow(QMainWindow):
         """USB-устройства идут первыми: у них есть vid, у ttyS* его нет."""
         current = self._ports.currentData()
         self._ports.clear()
+        self._ports.addItem("Демо — работа без платы", DEMO_PORT)
         for port in sorted(get_ports(), key=lambda p: (p.vid is None, p.device)):
             self._ports.addItem(f"{port.device} — {port.description}", port.device)
         index = self._ports.findData(current)
@@ -140,7 +142,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Порт не выбран",
                                 "Сначала выберите порт в списке.")
             return
-        client = Client(MySerialTransport(port))
+        demo = port == DEMO_PORT
+        client = Client(DemoTransport() if demo else MySerialTransport(port))
         client.on_lost = self._on_lost
         try:
             client.connect()
@@ -150,7 +153,8 @@ class MainWindow(QMainWindow):
             return
         self._client = client
         self._fault = False
-        self._log("info", f"порт {port} открыт")
+        self._log("info", "демо-режим: платы нет, отвечает эмулятор"
+                  if demo else f"порт {port} открыт")
 
     def _disconnect(self) -> None:
         self._client.disconnect()
