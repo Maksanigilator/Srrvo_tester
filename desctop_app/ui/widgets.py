@@ -151,11 +151,17 @@ class Console(QWidget):
         bar.setValue(bar.maximum())
 
 
+# ключ, подпись, единица, делитель и знаков после запятой.
+# Напряжение приходит в десятых долях вольта, как лежит в регистре 0x3E.
 TELEMETRY_FIELDS = (
-    ("pos", "Позиция", "шаг"), ("spd", "Скорость", "шаг/с"),
-    ("load", "Нагрузка", "1/1000"), ("cur", "Ток", "мА"),
-    ("volt", "Напряжение", "В"), ("temp", "Температура", "°C"),
-    ("mode", "Режим", ""), ("err", "Ошибки", ""),
+    ("pos", "Позиция", "шаг", 1, 0),
+    ("spd", "Скорость", "шаг/с", 1, 0),
+    ("load", "Нагрузка", "1/1000", 1, 0),
+    ("cur", "Ток", "мА", 1, 0),
+    ("volt", "Напряжение", "В", 10, 1),
+    ("temp", "Температура", "°C", 1, 0),
+    ("mode", "Режим", "", 1, 0),
+    ("err", "Ошибки", "", 1, 0),
 )
 
 
@@ -166,7 +172,7 @@ class TelemetryPanel(QGroupBox):
         super().__init__("Телеметрия")
         grid = QGridLayout(self)
         self._values: dict[str, QLabel] = {}
-        for row, (key, title, unit) in enumerate(TELEMETRY_FIELDS):
+        for row, (key, title, unit, _, _) in enumerate(TELEMETRY_FIELDS):
             value = QLabel("?")
             value.setFont(QFont("monospace", 11, QFont.Weight.Bold))
             value.setAlignment(Qt.AlignmentFlag.AlignRight)
@@ -180,9 +186,13 @@ class TelemetryPanel(QGroupBox):
         grid.setVerticalSpacing(8)
 
     def update_values(self, message: dict) -> None:
-        for key, _, _ in TELEMETRY_FIELDS:
-            if key in message:
-                self._values[key].setText(str(message[key]))
+        for key, _, _, divider, digits in TELEMETRY_FIELDS:
+            if key not in message:
+                continue
+            value = message[key]
+            if divider != 1 and isinstance(value, (int, float)):
+                value = f"{value / divider:.{digits}f}"
+            self._values[key].setText(str(value))
 
 
 class PositionControl(QGroupBox):
@@ -220,6 +230,11 @@ class PositionControl(QGroupBox):
 
     def target(self) -> int:
         return self._target.value()
+
+    def set_range(self, low: int, high: int) -> None:
+        """Цель нельзя задать вне разрешённого диапазона."""
+        self._target.setRange(low, high)
+        self._slider.setRange(low, high)
 
     def _changed(self, steps: int) -> None:
         self._degrees.setText(f"{steps * 360 / (POSITION_MAX + 1):.1f}°")

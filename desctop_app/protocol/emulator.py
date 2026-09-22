@@ -137,8 +137,9 @@ class FakeServo:
 class Homing:
     """Автомат поиска упора. Повторяет логику, задуманную для прошивки."""
 
-    def __init__(self, servo: FakeServo, config: dict, emit) -> None:
+    def __init__(self, servo: FakeServo, config: dict, emit, done) -> None:
         self._servo = servo
+        self._done = done
         self._config = config
         self._emit = emit
         self._started = time.monotonic()
@@ -166,7 +167,12 @@ class Homing:
             self._servo.speed = 0.0
             self._servo.mode = "idle"
             self._servo.zero = int(self._servo.position)
-            self._emit(EVT_HOMING, status=STATUS_COMPLETED, zero=self._servo.zero)
+            # Найденный упор становится нулём: дальше позиции протокола
+            # отсчитываются от него.
+            self._done(self._servo.position)
+            self._emit(EVT_HOMING, status=STATUS_COMPLETED,
+                       zero=self._config["home_zero"],
+                       zero_raw=int(self._servo.position))
             return False
         return True
 
@@ -192,6 +198,10 @@ class DemoTransport:
         self._config = dict(FACTORY_CONFIG)
         self._servo = FakeServo()
         self._homing: Homing | None = None
+        # Система координат, как в прошивке: zero_raw это сырая позиция,
+        # соответствующая config["home_zero"]. До homing преобразование
+        # тождественно.
+        self._zero_raw = float(FACTORY_CONFIG["home_zero"])
         self._boot = time.monotonic()
         self._last_step = time.monotonic()
         self._next_tlm = 0.0
@@ -241,11 +251,12 @@ class DemoTransport:
         now = time.monotonic()
         dt = min(now - self._last_step, 0.2)
         self._last_step = now
-        limits = (self._config["min_pos"], self._config["max_pos"])
+        limits = (self._to_raw(self._config["min_pos"]),
+                  self._to_raw(self._config["max_pos"]))
         self._servo.step(dt, limits, ignore_limits=self._homing is not None)
         if self._homing is not None and not self._homing.step():
             self._homing = None
-        self._watch_limits(limits)
+        self._watch_limits((self._config["min_pos"], self._config["max_pos"]))
 
     def _watch_limits(self, limits: tuple[int, int]) -> None:
         """Останавливает непрерывное вращение на границе диапазона.
@@ -256,16 +267,23 @@ class DemoTransport:
         if self._servo.mode != "motor" or self._homing is not None:
             return
         low, high = limits
-        if self._servo.position < low:
+        here = self._to_user(self._servo.position)
+        if here < low:
             reason = "min_pos"
-        elif self._servo.position > high:
+        elif here > high:
             reason = "max_pos"
         else:
             return
         self._servo.speed = 0.0
         self._servo.mode = "idle"
         self._servo.target = self._servo.position
-        self._emit(EVT_LIMIT, reason=reason, pos=int(self._servo.position))
+        self._emit(EVT_LIMIT, reason=reason, pos=here)
+
+    def _to_user(self, raw: float) -> int:
+        return int(raw - self._zero_raw + self._config["home_zero"])
+
+    def _to_raw(self, user: float) -> float:
+        return user + self._zero_raw - self._config["home_zero"]
 
     def _telemetry(self) -> str:
         self._frame += 1
@@ -273,8 +291,8 @@ class DemoTransport:
         frame = {
             "type": TYPE_TLM,
             "t": int((time.monotonic() - self._boot) * 1000),
-            "pos": int(servo.position),
-            "tgt": int(servo.target),
+            "pos": self._to_user(servo.position),
+            "tgt": self._to_user(servo.target),
             "spd": int(servo.speed if servo.mode == "motor"
                        else (servo.target - servo.position) * 2),
             "load": int(servo.load),
@@ -329,11 +347,11 @@ class DemoTransport:
         unknown = set(values) - set(FACTORY_CONFIG)
         if unknown:
             self._reply(msg_id, ok=False, error=ERR_BAD_PARAM,
-                        data={"unknown": sorted(unknown)})
+                        data={"field": sorted(unknown)[0], "value": 0})
             return
         if values.get("min_pos", 0) >= values.get("max_pos", POSITION_MAX):
             self._reply(msg_id, ok=False, error=ERR_BAD_PARAM,
-                        data={"reason": "min_pos >= max_pos"})
+                        data={"field": "min_pos", "value": values.get("min_pos", 0)})
             return
         self._config.update(values)
         self._reply(msg_id, ok=True, data={"written": len(values)})
@@ -346,10 +364,10 @@ class DemoTransport:
         low, high = self._config["min_pos"], self._config["max_pos"]
         if not isinstance(pos, int) or not low <= pos <= high:
             self._reply(msg_id, ok=False, error=ERR_BAD_PARAM,
-                        data={"pos": pos, "allowed": [low, high]})
+                        data={"field": "pos", "value": pos})
             return
         self._servo.mode = "position"
-        self._servo.target = float(pos)
+        self._servo.target = self._to_raw(pos)
         self._servo.speed = float(self._config["speed"])
         self._reply(msg_id, ok=True, data={"pos": pos})
 
@@ -361,16 +379,16 @@ class DemoTransport:
         speed = message.get("speed", self._config["speed"])
         if direction not in ("cw", "ccw") or not isinstance(speed, int):
             self._reply(msg_id, ok=False, error=ERR_BAD_PARAM,
-                        data={"dir": direction, "speed": speed})
+                        data={"field": "dir", "value": 0})
             return
         # Если уже за границей, наружу не пускаем, а внутрь разрешаем.
         low, high = self._config["min_pos"], self._config["max_pos"]
-        outward = ((self._servo.position <= low and direction == "cw")
-                   or (self._servo.position >= high and direction == "ccw"))
+        here = self._to_user(self._servo.position)
+        outward = ((here <= low and direction == "cw")
+                   or (here >= high and direction == "ccw"))
         if outward:
             self._reply(msg_id, ok=False, error=ERR_BAD_PARAM,
-                        data={"reason": "вне диапазона", "pos": int(self._servo.position),
-                              "allowed": [low, high]})
+                        data={"field": "pos", "value": here})
             return
         self._servo.mode = "motor"
         self._servo.speed = speed * (-1 if direction == "cw" else 1)
@@ -386,9 +404,13 @@ class DemoTransport:
         self._servo.target = self._servo.position
         self._reply(msg_id, ok=True)
 
+    def _set_zero(self, raw: float) -> None:
+        self._zero_raw = raw
+
     def _home(self, msg_id) -> None:
         if self._homing is not None:
             self._reply(msg_id, ok=False, error="BUSY")
             return
         self._reply(msg_id, ok=True)        # результат придёт событием
-        self._homing = Homing(self._servo, self._config, self._emit)
+        self._homing = Homing(self._servo, self._config, self._emit,
+                              self._set_zero)

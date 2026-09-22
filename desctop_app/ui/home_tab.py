@@ -87,6 +87,7 @@ class HomeTab(QWidget):
 
     def set_range(self, min_pos: int, max_pos: int) -> None:
         self._dial.update_values(min_pos=min_pos, max_pos=max_pos)
+        self._position.set_range(min_pos, max_pos)
 
     def set_zero(self, steps: int) -> None:
         """Отметка нуля на диаграмме после успешного homing."""

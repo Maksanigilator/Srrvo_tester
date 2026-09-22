@@ -29,13 +29,17 @@ const uint8_t SERVO_TX = 19;
 const uint32_t SERVO_BAUD = 1000000;
 const uint8_t SERVO_ID = 1;
 
-const char FIRMWARE[] = "0.2.1";
+const char FIRMWARE[] = "0.3.0";
 const size_t HOST_LINE_MAX = 512;          // длиннее команд не бывает
 const uint32_t TLM_FAST_MS = 50;           // 20 Гц в движении
 const uint32_t TLM_IDLE_MS = 200;          // 5 Гц в покое
 const uint8_t TLM_SLOW_EVERY = 10;         // как часто повторять медленные поля
 const size_t TLM_RESERVE = 200;            // сколько места нужно под кадр
 const uint8_t SERVO_FAIL_LIMIT = 5;        // после стольких неответов считаем молчащей
+/* Плата питается отдельно, и выдернутый USB её не останавливает. Если во
+ * время движения от ПК нет команд дольше этого времени, привод стоп.
+ * Приложение, пока движение идёт, шлёт ping как подтверждение присутствия. */
+const uint32_t HOST_TIMEOUT_MS = 3000;
 
 SMS_STS st;
 Preferences storage;
@@ -100,6 +104,21 @@ Mode mode = MODE_IDLE;
 int servoMode = -1;
 int32_t targetPos = 2048;
 
+/* Система координат.
+ *
+ * zeroRaw это сырая позиция сервы, которая соответствует config[HOME_ZERO].
+ * До успешного homing преобразование тождественно. После него нулём
+ * становится найденный упор, и все позиции протокола отсчитываются от него.
+ *
+ * Запись 128 в 0x28 сознательно НЕ используется: она жёстко назначает
+ * текущей точке значение 2048, что бы ни стояло в home_zero, и пишет
+ * смещение в EPROM. Считать сдвиг на плате дешевле и точнее.
+ */
+int32_t zeroRaw = 0;
+
+static int32_t toUser(int32_t raw) { return raw - zeroRaw + config[HOME_ZERO]; }
+static int32_t toRaw(int32_t user) { return user + zeroRaw - config[HOME_ZERO]; }
+
 enum HomingState { HOMING_OFF, HOMING_RUN };
 HomingState homing = HOMING_OFF;
 uint32_t homingStarted = 0;
@@ -111,6 +130,7 @@ static size_t lineLen = 0;
 static bool lineOverflow = false;
 
 uint32_t lastTlm = 0;
+uint32_t lastHostCmd = 0;
 uint32_t tlmFrame = 0;
 uint8_t servoFails = 0;
 bool servoSilentReported = false;
@@ -152,12 +172,30 @@ static void replyError(long id, const char *code) {
   reply(id, false, empty, code);
 }
 
+/* Отказ с указанием поля: иначе по одному BAD_PARAM непонятно,
+ * что именно не понравилось. Эмулятор подробности передаёт, прошивка
+ * должна вести себя так же. */
+static void replyBadParam(long id, const char *field, int32_t value) {
+  JsonDocument data;
+  data["field"] = field;
+  data["value"] = value;
+  reply(id, false, data, "BAD_PARAM");
+}
+
 /* Останавливает непрерывное вращение на границе диапазона.
  *
  * В этом режиме серва пределы 0x09 и 0x0B НЕ соблюдает, это смысл режима,
  * поэтому следит прошивка по телеметрии. Точность ограничена периодом
  * опроса: при 20 Гц и 3400 шаг/с привод успевает проскочить до 170 шагов.
  */
+static void emitFault(const char *reason) {
+  JsonDocument doc;
+  doc["type"] = "evt";
+  doc["event"] = "fault";
+  doc["reason"] = reason;
+  sendLine(doc);
+}
+
 static void emitLimit(const char *reason, int pos) {
   JsonDocument doc;
   doc["type"] = "evt";
@@ -176,7 +214,8 @@ static void emitHoming(const char *status, const char *reason, bool withZero) {
     doc["reason"] = reason;
   }
   if (withZero) {
-    doc["zero"] = config[HOME_ZERO];
+    doc["zero"] = config[HOME_ZERO];      // в пользовательских координатах
+    doc["zero_raw"] = zeroRaw;            // сырая позиция найденного упора
   }
   sendLine(doc);
 }
@@ -233,10 +272,15 @@ static int applyToServo(const int32_t *previous) {
       st.unLockEprom(SERVO_ID);
       unlocked = true;
     }
+    int32_t value = config[i];
+    if (i == MIN_POS || i == MAX_POS) {
+      // Серва проверяет пределы в своих сырых координатах.
+      value = toRaw(value);
+    }
     if (CONFIG[i].word) {
-      st.writeWord(SERVO_ID, CONFIG[i].reg, (uint16_t)config[i]);
+      st.writeWord(SERVO_ID, CONFIG[i].reg, (uint16_t)value);
     } else {
-      st.writeByte(SERVO_ID, CONFIG[i].reg, (uint8_t)config[i]);
+      st.writeByte(SERVO_ID, CONFIG[i].reg, (uint8_t)value);
     }
     written++;
   }
@@ -244,6 +288,14 @@ static int applyToServo(const int32_t *previous) {
     st.LockEprom(SERVO_ID);
   }
   return written;
+}
+
+/* Перезаписывает 0x09 и 0x0B после сдвига системы координат. */
+static void applyLimits() {
+  st.unLockEprom(SERVO_ID);
+  st.writeWord(SERVO_ID, 0x09, (uint16_t)toRaw(config[MIN_POS]));
+  st.writeWord(SERVO_ID, 0x0B, (uint16_t)toRaw(config[MAX_POS]));
+  st.LockEprom(SERVO_ID);
 }
 
 static void setServoMode(int wanted) {
@@ -273,7 +325,9 @@ static bool readFeedback() {
   last.cur = st.ReadCurrent(-1);
   last.volt = st.ReadVoltage(-1);
   last.temp = st.ReadTemper(-1);
-  last.err = st.getErr();
+  // getErr это флаг ошибки ОБМЕНА библиотеки, а статус сервы лежит
+  // в SCS::Error, куда его кладёт SCS::Read из байта ответа.
+  last.err = st.Error;
   last.valid = true;
   return true;
 }
@@ -284,8 +338,8 @@ static void sendTelemetry() {
   JsonDocument doc;
   doc["type"] = "tlm";
   doc["t"] = millis();
-  doc["pos"] = last.pos;
-  doc["tgt"] = targetPos;
+  doc["pos"] = toUser(last.pos);
+  doc["tgt"] = toUser(targetPos);
   doc["spd"] = last.spd;
   doc["load"] = last.load;
   doc["cur"] = (int)(last.cur * 6.5f);          // единица регистра 6.5 мА
@@ -307,6 +361,8 @@ static void homingStop() {
   mode = MODE_IDLE;
   homing = HOMING_OFF;
 }
+
+static void stopMotion();
 
 static void homingBegin(long id) {
   homingStarted = millis();
@@ -349,8 +405,14 @@ static void homingStep() {
     setServoMode(0);
     // Текущую позицию объявляем нулём: запись 128 в регистр 0x28 делает
     // это средствами самой сервы.
-    st.writeByte(SERVO_ID, 40, 128);
-    config[HOME_ZERO] = last.pos;
+    // Найденный упор объявляем нулём: с этого момента toUser(last.pos)
+    // возвращает ровно config[HOME_ZERO].
+    zeroRaw = last.pos;
+    storage.begin("servo", false);
+    storage.putInt("zero_raw", zeroRaw);
+    storage.end();
+    // Пределы заданы в новых координатах, значит их сырые значения уехали.
+    applyLimits();
     emitHoming("completed", nullptr, true);
   }
 }
@@ -389,7 +451,7 @@ static void cmdSetConfig(long id, JsonDocument &message) {
     if (i == HOME_DIR) {
       const char *dir = value.as<const char *>();
       if (!dir || (strcmp(dir, "cw") != 0 && strcmp(dir, "ccw") != 0)) {
-        replyError(id, "BAD_PARAM");
+        replyBadParam(id, "home_dir", 0);
         return;
       }
       config[i] = strcmp(dir, "cw") == 0 ? 0 : 1;
@@ -398,8 +460,9 @@ static void cmdSetConfig(long id, JsonDocument &message) {
     }
   }
   if (config[MIN_POS] >= config[MAX_POS]) {
+    int32_t bad = config[MIN_POS];
     memcpy(config, previous, sizeof(config));
-    replyError(id, "BAD_PARAM");
+    replyBadParam(id, "min_pos", bad);
     return;
   }
   int written = applyToServo(previous);
@@ -417,18 +480,18 @@ static void cmdMove(long id, JsonDocument &message) {
   }
   JsonVariant value = message["pos"];
   if (value.isNull()) {
-    replyError(id, "BAD_PARAM");
+    replyBadParam(id, "pos", 0);
     return;
   }
   int32_t pos = value.as<int32_t>();
   if (pos < config[MIN_POS] || pos > config[MAX_POS]) {
-    replyError(id, "BAD_PARAM");
+    replyBadParam(id, "pos", pos);
     return;
   }
   setServoMode(0);
   mode = MODE_POSITION;
-  targetPos = pos;
-  st.WritePosEx(SERVO_ID, (s16)pos, (u16)config[SPEED], (u8)config[ACCEL]);
+  targetPos = toRaw(pos);
+  st.WritePosEx(SERVO_ID, (s16)targetPos, (u16)config[SPEED], (u8)config[ACCEL]);
   JsonDocument data;
   data["pos"] = pos;
   reply(id, true, data, nullptr);
@@ -441,21 +504,22 @@ static void cmdMotor(long id, JsonDocument &message) {
   }
   const char *dir = message["dir"].as<const char *>();
   if (!dir || (strcmp(dir, "cw") != 0 && strcmp(dir, "ccw") != 0)) {
-    replyError(id, "BAD_PARAM");
+    replyBadParam(id, "dir", 0);
     return;
   }
   int32_t speed = message["speed"].isNull() ? config[SPEED]
                                             : message["speed"].as<int32_t>();
   if (speed < 0 || speed > 3400) {
-    replyError(id, "BAD_PARAM");
+    replyBadParam(id, "speed", speed);
     return;
   }
   // Если уже за границей, наружу не пускаем, а внутрь разрешаем.
   if (last.valid) {
-    bool outward = (last.pos <= config[MIN_POS] && strcmp(dir, "cw") == 0) ||
-                   (last.pos >= config[MAX_POS] && strcmp(dir, "ccw") == 0);
+    int32_t here = toUser(last.pos);
+    bool outward = (here <= config[MIN_POS] && strcmp(dir, "cw") == 0) ||
+                   (here >= config[MAX_POS] && strcmp(dir, "ccw") == 0);
     if (outward) {
-      replyError(id, "BAD_PARAM");
+      replyBadParam(id, "pos", here);
       return;
     }
   }
@@ -469,20 +533,36 @@ static void cmdMotor(long id, JsonDocument &message) {
   reply(id, true, data, nullptr);
 }
 
-/* STOP работает всегда, в том числе посреди homing: это аварийная команда. */
+/* STOP работает всегда, в том числе посреди homing: это аварийная команда.
+ *
+ * Обнуления скорости НЕДОСТАТОЧНО: WriteSpe пишет только в 0x29 и 0x2E,
+ * а регистр цели 0x2A остаётся прежним, и в позиционном режиме серва
+ * продолжит ехать к старой цели. Поэтому цель перебивается текущей
+ * позицией. Если серва не ответила и позиции нет, снимаем момент:
+ * обмякнуть безопаснее, чем ехать неизвестно куда.
+ */
+static void stopMotion() {
+  if (servoMode == 1) {
+    st.WriteSpe(SERVO_ID, 0, 0);
+  }
+  int pos = st.ReadPos(SERVO_ID);
+  if (pos != -1) {
+    setServoMode(0);
+    targetPos = pos;
+    uint16_t speed = config[SPEED] > 0 ? (uint16_t)config[SPEED] : 1000;
+    st.WritePosEx(SERVO_ID, (s16)pos, speed, 0);
+  } else {
+    st.EnableTorque(SERVO_ID, 0);
+  }
+  mode = MODE_IDLE;
+}
+
 static void cmdStop(long id) {
   if (homing != HOMING_OFF) {
     homingStop();
     emitHoming("stopped", nullptr, false);
   }
-  st.WriteSpe(SERVO_ID, 0, 0);
-  if (mode == MODE_POSITION && last.valid) {
-    // В позиционном режиме удерживаем текущую точку, а не обмякаем.
-    setServoMode(0);
-    targetPos = last.pos;
-    st.WritePosEx(SERVO_ID, (s16)last.pos, (u16)config[SPEED], 0);
-  }
-  mode = MODE_IDLE;
+  stopMotion();
   replyOk(id);
 }
 
@@ -494,6 +574,7 @@ static void handleLine(const char *text) {
     replyError(0, "BAD_JSON");      // id неизвестен, наши начинаются с 1
     return;
   }
+  lastHostCmd = millis();      // любая разобранная команда это признак жизни ПК
   long id = message["id"] | 0L;
   const char *cmd = message["cmd"];
   if (cmd == nullptr) {
@@ -561,7 +642,11 @@ void setup() {
   st.IOTimeOut = 10;
   delay(1000);                       // серве нужно время на загрузку
 
+  lastHostCmd = millis();
   configLoad();
+  storage.begin("servo", true);
+  zeroRaw = storage.getInt("zero_raw", config[HOME_ZERO]);
+  storage.end();
   applyToServo(nullptr);             // при старте пишем всё: что стоит в серве, мы не знаем
   setServoMode(0);
 }
@@ -579,19 +664,32 @@ void loop() {
     bool ok = readFeedback();
     if (homing != HOMING_OFF) {
       homingStep();
-    } else if (ok && mode == MODE_MOTOR &&
-               (last.pos < config[MIN_POS] || last.pos > config[MAX_POS])) {
-      st.WriteSpe(SERVO_ID, 0, 0);
-      mode = MODE_IDLE;
-      emitLimit(last.pos < config[MIN_POS] ? "min_pos" : "max_pos", last.pos);
+    } else if (mode == MODE_MOTOR) {
+      int32_t here = toUser(last.pos);
+      if (ok && (here < config[MIN_POS] || here > config[MAX_POS])) {
+        stopMotion();
+        emitLimit(here < config[MIN_POS] ? "min_pos" : "max_pos", here);
+      } else if (!ok && servoFails >= SERVO_FAIL_LIMIT) {
+        // Серва замолчала, а привод крутится: следить за диапазоном больше
+        // нечем, поэтому останавливаем. В homing этот случай уже обработан.
+        stopMotion();
+        emitFault("servo_silent");
+      }
+    }
+    // Связь с ПК потеряна во время движения: плата питается отдельно,
+    // и сама себя не остановит.
+    if ((mode != MODE_IDLE || homing != HOMING_OFF) &&
+        millis() - lastHostCmd > HOST_TIMEOUT_MS) {
+      if (homing != HOMING_OFF) {
+        homingStop();
+        emitHoming("error", "host_timeout", false);
+      }
+      stopMotion();
+      emitFault("host_timeout");
     }
     if (!ok && servoFails >= SERVO_FAIL_LIMIT && !servoSilentReported) {
       servoSilentReported = true;
-      JsonDocument doc;
-      doc["type"] = "evt";
-      doc["event"] = "fault";
-      doc["reason"] = "servo_silent";
-      sendLine(doc);
+      emitFault("servo_silent");
     }
     // Кадр телеметрии расходный: места в буфере нет, значит пропускаем.
     // Ответы на команды так не пропускаются никогда.

@@ -81,7 +81,11 @@ class Client:
         while not self._stop.is_set():
             try:
                 line = self._transport.read_line()
-            except OSError as error:
+            except Exception as error:
+                # Ловим всё: поток, умерший молча, оставит интерфейс в
+                # состоянии "подключено" навсегда, а данные просто пропадут.
+                # OSError это обрыв порта, но прилететь может и ValueError
+                # из закрытого транспорта, и что угодно ещё.
                 if self.on_lost is not None:
                     self.on_lost(error)
                 return

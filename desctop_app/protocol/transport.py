@@ -82,23 +82,34 @@ class MySerialTransport:
 
 
     def read_line(self) -> str | None:
-        """"""
+        """Возвращает очередную полную строку или None.
+
+        Сначала проверяется собственный буфер и только потом порт: за один
+        read может прийти несколько строк, и если лезть в порт первым, каждая
+        следующая будет ждать полный таймаут. На пачке из двадцати строк это
+        давало почти две секунды задержки.
+        """
         if self._serial == None:
             raise ValueError("нет порта")
+
+        message = self._take_line()
+        if message is not None:
+            return message
+
         count = self._serial.in_waiting
         if count == 0:
             count = 1
-        data = self._serial.read(count)
-        #беру байты из буфера чтения и добавляю в буфер для сообщения
-        self._buffer += data
-        i = self._buffer.find(b"\n")#индекс разделителя
+        self._buffer += self._serial.read(count)
+        return self._take_line()
 
+    def _take_line(self) -> str | None:
+        """Отрезает из буфера первую готовую строку, если она там есть."""
+        i = self._buffer.find(b"\n")
         if i == -1:
             if len(self._buffer) > MESSAGE_MAX_LINE:
                 self._buffer.clear()
             return None
-
-        message = self._buffer[:i].decode(errors="replace").rstrip("\r")#обрезаю до i. errors="replace" превращает ошибку в символ ? . .rstrip("\r") обрезает /r
-        del self._buffer[:i+1]
+        # errors="replace" оставляет мусор видимым, а не роняет поток чтения
+        message = self._buffer[:i].decode(errors="replace").rstrip("\r")
+        del self._buffer[:i + 1]
         return message
-

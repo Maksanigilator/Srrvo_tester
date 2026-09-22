@@ -17,6 +17,7 @@ STOP вынесен в постоянную панель намеренно: п�
 import json
 import queue
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -44,7 +45,9 @@ from ..protocol.message import (
     CMD_PING,
     CMD_SET_CFG,
     CMD_STOP,
+    EVT_FAULT,
     EVT_HOMING,
+    EVT_LIMIT,
     STATUS_COMPLETED,
     STATUS_ERROR,
     TYPE_EVT,
@@ -59,6 +62,12 @@ from .theme import C_DIM, C_ERR, C_OK
 from .widgets import Console
 
 POLL_INTERVAL_MS = 30
+# Плата шлёт телеметрию не реже 5 Гц даже в покое, поэтому пауза
+# длиннее этого означает, что она замолчала.
+TELEMETRY_SILENCE_S = 2.0
+# Пока привод движется, плата ждёт от нас признак жизни: без него она
+# остановит движение через HOST_TIMEOUT_MS. Шлём вдвое чаще запаса.
+KEEPALIVE_S = 1.5
 DEFAULT_PROFILE = "default.json"
 
 
@@ -92,6 +101,10 @@ class MainWindow(QMainWindow):
         self._client: Client | None = None
         self._fault = False
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._last_tlm = 0.0
+        self._last_cmd = 0.0
+        self._moving = False
+        self._silent = False
 
         self.setWindowTitle("Servo Tester, конфигуратор Feetech STS3215")
         self.setMinimumSize(900, 580)
@@ -171,10 +184,14 @@ class MainWindow(QMainWindow):
             f"background:{C_ERR}; color:#101010; font-weight:bold; padding:6px 18px;")
         self._stop_button.clicked.connect(lambda: self._send(CMD_STOP))
         self._status = QLabel()
+        # Отдельная строка для того, что требует внимания: сработал предел,
+        # отказала команда, пропала телеметрия. Иначе это видно только
+        # в консоли, которую можно свернуть.
+        self._alert = QLabel()
 
         for widget in (QLabel(" Порт: "), self._ports, self._refresh_button,
                        self._connect_button, self._ping_button,
-                       self._stop_button, self._status):
+                       self._stop_button, self._status, self._alert):
             bar.addWidget(widget)
         # распорка прижимает кнопки конфигурации к правому краю
         spacer = QWidget()
@@ -233,6 +250,9 @@ class MainWindow(QMainWindow):
             return
         self._client = client
         self._fault = False
+        self._silent = False
+        self._last_tlm = time.monotonic()
+        self._alarm("")
         self._note("info", "демо-режим: платы нет, отвечает эмулятор"
                    if demo else f"порт {port} открыт")
 
@@ -240,6 +260,7 @@ class MainWindow(QMainWindow):
         self._client.disconnect()
         self._client = None
         self._fault = False
+        self._moving = False
         self._params.forget_device()
         self._note("info", "отключено")
 
@@ -250,6 +271,7 @@ class MainWindow(QMainWindow):
         client = self._client
         if client is None:
             return
+        self._last_cmd = time.monotonic()
         threading.Thread(target=self._worker, args=(client, cmd, params),
                          daemon=True).start()
 
@@ -259,11 +281,16 @@ class MainWindow(QMainWindow):
         except (TimeoutError, OSError, ValueError) as error:
             self._events.put(("error", f"{cmd}: {error}"))
             return
-        if answer.get("ok"):
-            if cmd == CMD_GET_CFG and isinstance(answer.get("data"), dict):
-                self._events.put(("config", json.dumps(answer["data"])))
-            elif cmd == CMD_SET_CFG:
-                self._events.put(("written", json.dumps(params)))
+        if not answer.get("ok"):
+            detail = answer.get("data")
+            tail = f", {detail}" if detail else ""
+            self._events.put(("fail", f"{cmd}: {answer.get('error')}{tail}"))
+            return
+        self._events.put(("done", ""))
+        if cmd == CMD_GET_CFG and isinstance(answer.get("data"), dict):
+            self._events.put(("config", json.dumps(answer["data"])))
+        elif cmd == CMD_SET_CFG:
+            self._events.put(("written", json.dumps(params)))
 
     def _write_config(self) -> None:
         self._send(CMD_SET_CFG, **self._params.collect())
@@ -330,6 +357,8 @@ class MainWindow(QMainWindow):
     # --- опрос -------------------------------------------------------------
 
     def _poll(self) -> None:
+        self._check_silence()
+        self._keepalive()
         if self._client is not None:
             self._drain(self._client.raw, lambda item: self._on_raw(*item))
             self._drain(self._client.incoming, self._on_message)
@@ -344,6 +373,40 @@ class MainWindow(QMainWindow):
                 return
             handler(item)
 
+    def _keepalive(self) -> None:
+        """Подтверждает присутствие, пока привод движется.
+
+        Плата питается отдельно и сама не узнает, что кабель выдернули,
+        поэтому она останавливает движение, если от ПК давно нет команд.
+        Молчим только когда привод стоит: лишний обмен ни к чему.
+        """
+        if self._client is None or not self._moving:
+            return
+        if time.monotonic() - self._last_cmd >= KEEPALIVE_S:
+            self._send(CMD_PING)
+
+    def _check_silence(self) -> None:
+        """Зависшая плата исключения не даёт: порт открыт, данных нет.
+
+        Единственный признак жизни устройства это поток телеметрии, поэтому
+        следим за паузой в нём. Требование п. 7 про отсутствие ответа ESP32.
+        """
+        if self._client is None or self._fault:
+            return
+        quiet = time.monotonic() - self._last_tlm
+        if quiet > TELEMETRY_SILENCE_S and not self._silent:
+            self._silent = True
+            self._alarm(f"нет телеметрии {quiet:.0f} с, устройство не отвечает")
+        elif quiet <= TELEMETRY_SILENCE_S and self._silent:
+            self._silent = False
+            self._alarm("")
+
+    def _alarm(self, text: str) -> None:
+        self._alert.setText(
+            f'<span style="color:{C_ERR}">  {text}</span>' if text else "")
+        if text:
+            self._note("error", text)
+
     def _on_raw(self, direction: str, line: str) -> None:
         if not self._show_tlm.isChecked() and '"tlm"' in line:
             return
@@ -351,11 +414,20 @@ class MainWindow(QMainWindow):
         self._readable.append(direction, describe(line))
 
     def _on_event(self, kind: str, text: str) -> None:
+        if kind == "fail":
+            self._alarm(text)
+            return
+        if kind == "done":
+            if not self._silent:
+                self._alarm("")      # удачная команда снимает прошлую тревогу
+            return
         if kind == "config":
             values = json.loads(text)
             self._params.apply(values)
             self._params.mark_on_device(values)
             self._home.set_default_speed(self._params.collect()["speed"])
+            self._home.set_range(int(values.get("min_pos", 0)),
+                                 int(values.get("max_pos", 4095)))
             self._note("info", "конфигурация прочитана с устройства")
             return
         if kind == "written":
@@ -373,6 +445,9 @@ class MainWindow(QMainWindow):
         """Телеметрия и события устройства, всё что не ответ на команду."""
         kind = message.get("type")
         if kind == TYPE_TLM:
+            self._last_tlm = time.monotonic()
+            if "mode" in message:
+                self._moving = message["mode"] != "idle"
             self._home.update_telemetry(message)
             self._manual.update_telemetry(message)
         elif kind == TYPE_EVT and message.get("event") == EVT_HOMING:
@@ -381,6 +456,13 @@ class MainWindow(QMainWindow):
             self._manual.set_homing_status(text)
             if message.get("status") == STATUS_COMPLETED and "zero" in message:
                 self._home.set_zero(int(message["zero"]))
+            if message.get("status") == STATUS_ERROR:
+                self._alarm(f"homing не удался: {message.get('reason')}")
+        elif kind == TYPE_EVT and message.get("event") == EVT_LIMIT:
+            self._alarm(f"привод вышел за диапазон ({message.get('reason')}), "
+                        f"остановлен на {message.get('pos')} шаг")
+        elif kind == TYPE_EVT and message.get("event") == EVT_FAULT:
+            self._alarm(f"неисправность: {message.get('reason')}")
 
     def _note(self, kind: str, text: str) -> None:
         """Служебное сообщение самого приложения, только в расшифровку."""
