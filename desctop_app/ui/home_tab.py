@@ -25,8 +25,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..protocol.message import CMD_MOTOR, CMD_STOP
 from .params import DEFAULT_CONFIG, POSITION_MAX, SPEED_MAX
-from .theme import C_ACCENT, C_DIM, C_OK, C_WARN
+from .theme import C_ACCENT, C_DIM, C_ERR, C_OK, C_WARN
 from .widgets import HomingControl, PositionControl, ServoDial, TelemetryPanel
 
 CHART_POINTS = 600                 # 30 секунд при 20 Гц
@@ -72,6 +73,10 @@ class HomeTab(QWidget):
         self._telemetry.update_values(message)
         if "pos" in message:
             self._dial.update_values(position=int(message["pos"]))
+        if "tgt" in message:
+            # Цель берём с устройства, а не с ползунка: во время homing её
+            # задаёт прошивка, и ползунок о ней ничего не знает.
+            self._dial.update_values(target=int(message["tgt"]))
         self._chart_data["t"].append(float(message.get("t", 0)) / 1000.0)
         for key in ("pos", "spd", "load"):
             self._chart_data[key].append(float(message.get(key, 0)))
@@ -83,6 +88,10 @@ class HomeTab(QWidget):
     def set_range(self, min_pos: int, max_pos: int) -> None:
         self._dial.update_values(min_pos=min_pos, max_pos=max_pos)
 
+    def set_zero(self, steps: int) -> None:
+        """Отметка нуля на диаграмме после успешного homing."""
+        self._dial.update_values(zero=steps)
+
     # --- построение --------------------------------------------------------
 
     def _build_controls(self) -> QWidget:
@@ -91,7 +100,8 @@ class HomeTab(QWidget):
         panel.setMaximumWidth(420)
         layout = QVBoxLayout(panel)
 
-        movement = PositionControl(self._send, self._on_target_changed)
+        self._position = PositionControl(self._send, self._on_target_changed)
+        movement = self._position
 
         motor = QGroupBox("Непрерывное вращение")
         mbox = QVBoxLayout(motor)
@@ -117,11 +127,18 @@ class HomeTab(QWidget):
         buttons = QHBoxLayout()
         cw = QPushButton("◀  CW")
         cw.clicked.connect(
-            lambda: self._send("motor", dir="cw", speed=self._speed.value()))
+            lambda: self._send(CMD_MOTOR, dir="cw", speed=self._speed.value()))
         ccw = QPushButton("CCW  ▶")
         ccw.clicked.connect(
-            lambda: self._send("motor", dir="ccw", speed=self._speed.value()))
+            lambda: self._send(CMD_MOTOR, dir="ccw", speed=self._speed.value()))
+        # Остановка рядом с кнопками вращения: та же команда, что у общего
+        # STOP, но не надо переводить взгляд на верхнюю панель.
+        stop = QPushButton("STOP")
+        stop.setStyleSheet(
+            f"background:{C_ERR}; color:#101010; font-weight:bold;")
+        stop.clicked.connect(lambda: self._send(CMD_STOP))
         buttons.addWidget(cw)
+        buttons.addWidget(stop, stretch=1)
         buttons.addWidget(ccw)
         mbox.addLayout(buttons)
 

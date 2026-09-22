@@ -23,6 +23,12 @@ from collections.abc import Callable
 from .message import TYPE_RESP, decode, encode_command
 from .transport import Transport
 
+# Очереди ограничены: если интерфейс подвиснет, а телеметрия продолжит
+# идти, безразмерная очередь съела бы память. Свежие данные важнее
+# старых, поэтому при переполнении выбрасывается самое старое.
+INCOMING_MAX = 2000
+RAW_MAX = 2000
+
 
 class Client:
     """Связывает транспорт с протоколом.
@@ -37,8 +43,8 @@ class Client:
         self._timeout = timeout
         self._ids = itertools.count(1)
         self._pending: dict[int, queue.Queue[dict]] = {}
-        self.incoming: queue.Queue[dict] = queue.Queue()
-        self.raw: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=2000)
+        self.incoming: queue.Queue[dict] = queue.Queue(maxsize=INCOMING_MAX)
+        self.raw: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=RAW_MAX)
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.on_lost: Callable[[Exception], None] | None = None
@@ -90,19 +96,20 @@ class Client:
                 if box is not None:
                     box.put(message)
             else:
-                self.incoming.put(message)
+                _put_newest(self.incoming, message)
 
     def _log_raw(self, direction: str, line: str) -> None:
-        """Складывает строку в очередь для консоли.
+        """Складывает строку в очередь для консоли."""
+        _put_newest(self.raw, (direction, line))
 
-        Очередь ограничена: если её никто не разгребает, старые строки
-        выбрасываются, иначе она съест память за час работы.
-        """
+
+def _put_newest(target: queue.Queue, item) -> None:
+    """Кладёт в очередь, при переполнении выбрасывая самое старое."""
+    try:
+        target.put_nowait(item)
+    except queue.Full:
         try:
-            self.raw.put_nowait((direction, line))
-        except queue.Full:
-            try:
-                self.raw.get_nowait()
-                self.raw.put_nowait((direction, line))
-            except (queue.Empty, queue.Full):
-                pass
+            target.get_nowait()
+            target.put_nowait(item)
+        except (queue.Empty, queue.Full):
+            pass

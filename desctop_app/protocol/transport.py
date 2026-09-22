@@ -2,6 +2,7 @@
 общение с портом
 """
 
+import threading
 from typing import Protocol
 
 import serial
@@ -44,6 +45,10 @@ class MySerialTransport:
         self.baudrate = baudrate
         self.timeout = timeout
         self._serial: serial.Serial | None = None
+        # Писателей может быть несколько: каждая команда уходит своим потоком.
+        # write() не атомарен, и без замка байты двух команд перемешались бы
+        # в линии. Замок только на запись: чтению мешать нечему.
+        self._write_lock = threading.Lock()
         self._buffer = bytearray() #список байтов
     
     def open(self) -> None:
@@ -72,7 +77,8 @@ class MySerialTransport:
         """отправляем сообщение без проверки успеха"""
         if self._serial == None:
             raise ValueError("нет порта")
-        self._serial.write((text + "\n").encode()) #encode str -> bytes
+        with self._write_lock:
+            self._serial.write((text + "\n").encode())  # str -> bytes
 
 
     def read_line(self) -> str | None:

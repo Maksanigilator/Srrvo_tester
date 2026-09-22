@@ -39,7 +39,17 @@ from PySide6.QtWidgets import (
 
 from ..protocol.client import Client
 from ..protocol.emulator import DEMO_PORT, DemoTransport
-from ..protocol.message import CMD_PING
+from ..protocol.message import (
+    CMD_GET_CFG,
+    CMD_PING,
+    CMD_SET_CFG,
+    CMD_STOP,
+    EVT_HOMING,
+    STATUS_COMPLETED,
+    STATUS_ERROR,
+    TYPE_EVT,
+    TYPE_TLM,
+)
 from ..protocol.transport import MySerialTransport, get_ports
 from .home_tab import HomeTab
 from .manual_tab import ManualTab
@@ -159,7 +169,7 @@ class MainWindow(QMainWindow):
         self._stop_button = QPushButton("STOP")
         self._stop_button.setStyleSheet(
             f"background:{C_ERR}; color:#101010; font-weight:bold; padding:6px 18px;")
-        self._stop_button.clicked.connect(lambda: self._send("stop"))
+        self._stop_button.clicked.connect(lambda: self._send(CMD_STOP))
         self._status = QLabel()
 
         for widget in (QLabel(" Порт: "), self._ports, self._refresh_button,
@@ -175,7 +185,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(QLabel(" Конфигурация: "))
 
         self._config_buttons = []
-        for title, slot in (("Read", lambda: self._send("get_config")),
+        for title, slot in (("Read", lambda: self._send(CMD_GET_CFG)),
                             ("Write", self._write_config),
                             ("Из файла", self._load_config),
                             ("В файл", self._save_config),
@@ -250,13 +260,13 @@ class MainWindow(QMainWindow):
             self._events.put(("error", f"{cmd}: {error}"))
             return
         if answer.get("ok"):
-            if cmd == "get_config" and isinstance(answer.get("data"), dict):
+            if cmd == CMD_GET_CFG and isinstance(answer.get("data"), dict):
                 self._events.put(("config", json.dumps(answer["data"])))
-            elif cmd == "set_config":
+            elif cmd == CMD_SET_CFG:
                 self._events.put(("written", json.dumps(params)))
 
     def _write_config(self) -> None:
-        self._send("set_config", **self._params.collect())
+        self._send(CMD_SET_CFG, **self._params.collect())
 
     def _reset_config(self) -> None:
         self._params.apply(DEFAULT_CONFIG)
@@ -362,13 +372,15 @@ class MainWindow(QMainWindow):
     def _on_message(self, message: dict) -> None:
         """Телеметрия и события устройства, всё что не ответ на команду."""
         kind = message.get("type")
-        if kind == "tlm":
+        if kind == TYPE_TLM:
             self._home.update_telemetry(message)
             self._manual.update_telemetry(message)
-        elif kind == "evt" and message.get("event") == "homing":
-            status = str(message.get("status", "?"))
-            self._home.set_homing_status(status)
-            self._manual.set_homing_status(status)
+        elif kind == TYPE_EVT and message.get("event") == EVT_HOMING:
+            text = homing_text(message)
+            self._home.set_homing_status(text)
+            self._manual.set_homing_status(text)
+            if message.get("status") == STATUS_COMPLETED and "zero" in message:
+                self._home.set_zero(int(message["zero"]))
 
     def _note(self, kind: str, text: str) -> None:
         """Служебное сообщение самого приложения, только в расшифровку."""
@@ -403,6 +415,21 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def homing_text(message: dict) -> str:
+    """Статус homing для интерфейса.
+
+    В протоколе статусов ровно четыре и они строчные, а причина отказа идёт
+    отдельным полем. Интерфейс принимает решение по статусу и просто
+    дописывает причину текстом, поэтому новая причина в прошивке не требует
+    правок здесь.
+    """
+    status = str(message.get("status", "?"))
+    text = status.capitalize()
+    if status == STATUS_ERROR and message.get("reason"):
+        text += f": {message['reason']}"
+    return text
+
+
 def describe(line: str) -> str:
     """Переводит строку протокола на человеческий язык."""
     try:
@@ -426,5 +453,11 @@ def describe(line: str) -> str:
         return (f"телеметрия: позиция {message.get('pos')}, "
                 f"скорость {message.get('spd')}, нагрузка {message.get('load')}")
     if kind == "evt":
-        return f"событие: {message.get('event')} {message.get('status', '')}"
+        event = message.get("event")
+        if event == "limit":
+            return (f"привод вышел за диапазон ({message.get('reason')}), "
+                    f"остановлен на {message.get('pos')} шаг")
+        parts = [str(message.get(k)) for k in ("event", "status", "reason")
+                 if message.get(k) is not None]
+        return "событие: " + " ".join(parts)
     return f"неизвестный тип сообщения: {kind}"

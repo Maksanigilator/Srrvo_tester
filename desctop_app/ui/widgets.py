@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..protocol.message import CMD_HOME, CMD_MOVE, CMD_STOP
 from .params import POSITION_MAX
 from .theme import CONSOLE_COLORS, C_ACCENT, C_DIM, C_TEXT, C_WARN, MARKERS
 
@@ -199,7 +200,7 @@ class PositionControl(QGroupBox):
         self._target.setValue(2048)
         self._degrees = QLabel()
         move = QPushButton("Move")
-        move.clicked.connect(lambda: self._send("move", pos=self._target.value()))
+        move.clicked.connect(lambda: self._send(CMD_MOVE, pos=self._target.value()))
         row.addWidget(QLabel("Цель"))
         row.addWidget(self._target)
         row.addWidget(self._degrees)
@@ -250,10 +251,10 @@ class HomingControl(QGroupBox):
 
     def _start(self) -> None:
         self._status.setText("Running")
-        self._send("home")
+        self._send(CMD_HOME)
 
     def _stop(self) -> None:
         """Отдельной команды прерывания нет: STOP останавливает любое
         движение, включая homing."""
         self._status.setText("Stopped")
-        self._send("stop")
+        self._send(CMD_STOP)
